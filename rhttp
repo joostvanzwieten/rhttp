@@ -1,0 +1,544 @@
+#! /usr/bin/env python3
+#
+# Copyright (c) 2015 Joost van Zwieten
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+import os, struct, subprocess, socket, threading, sys, mimetypes, shlex, urllib
+
+cmd_get_chunk = b'a'
+cmd_get_file_size = b'b'
+cmd_list_dir = b'c'
+
+max_chunk_size = 4096*8
+max_header_size = 4096
+
+
+class RemotePipe:
+
+    def __init__(self, i, o):
+
+        self._i = i
+        self._o = o
+        self._read = lambda n: os.read(i, n)
+        self._write = lambda s: os.write(o, s)
+        self.lock = threading.Lock()
+
+    @classmethod
+    def pair(cls):
+
+        p1r, p1w = os.pipe()
+        p2r, p2w = os.pipe()
+        return cls(p1r, p2w), cls(p2r, p1w)
+
+    def read_bytes(self, n=None):
+
+        if n is None:
+            n = self.read_int64()
+        if n > max_chunk_size:
+            raise ValueError
+        if n < 0:
+            raise OSError
+        chunk = b''
+        while len(chunk) < n:
+            part = self._read(n)
+            if not part:
+                raise EOFError
+            chunk += part
+        return chunk
+
+    def read_int64(self):
+
+        return struct.unpack('!q', self.read_bytes(8))[0]
+
+    def read_int32(self):
+
+        return struct.unpack('!i', self.read_bytes(4))[0]
+
+    def write_bytes(self, s):
+
+        while s:
+            n = self._write(s)
+            s = s[n:]
+
+    def write_variable_bytes(self, s):
+
+        self.write_int64(len(s))
+        self.write_bytes(s)
+
+    def write_int64(self, i):
+
+        self.write_bytes(struct.pack('!q', i))
+
+    def write_int32(self, i):
+
+        self.write_bytes(struct.pack('!i', i))
+
+
+def run_source(pipe, source_root, **settings):
+
+    root = os.path.realpath(os.path.expanduser(source_root))
+    del source_root
+    if not os.path.isdir(root):
+        print('ERROR: no such file or directory: {}'.format(root), file=sys.stderr)
+        raise SystemExit(1)
+    if not root.endswith(b'/'):
+        root += b'/'
+
+    while True:
+
+        cmd = pipe.read_bytes(1)
+        if cmd == cmd_get_chunk:
+            filename = pipe.read_bytes()
+            offset = pipe.read_int64()
+            size = pipe.read_int64()
+            if size > max_chunk_size:
+                raise ValueError
+            filename = os.path.realpath(os.path.join(root, filename))
+            if not filename.startswith(root) and filename != root[:-1]:
+                pipe.write_int64(-1)
+                continue
+            try:
+                with open(filename, 'rb') as f:
+                    actual_offset = os.lseek(f.fileno(), offset, os.SEEK_SET)
+                    chunk = os.read(f.fileno(), size)
+                    pipe.write_variable_bytes(chunk)
+            except OSError:
+                pipe.write_int64(-1)
+                continue
+        elif cmd == cmd_get_file_size:
+            filename = pipe.read_bytes()
+            filename = os.path.realpath(os.path.join(root, filename))
+            if not filename.startswith(root) and filename != root[:-1]:
+                pipe.write_int64(-1)
+                continue
+            if os.path.isdir(filename):
+                pipe.write_int64(-2)
+                continue
+            try:
+                with open(filename, 'rb') as f:
+                    file_stat = os.stat(f.fileno())
+                    pipe.write_int64(file_stat.st_size)
+            except OSError:
+                pipe.write_int64(-1)
+                continue
+        elif cmd == cmd_list_dir:
+            filename = pipe.read_bytes()
+            filename = os.path.realpath(os.path.join(root, filename))
+            if not filename.startswith(root) and filename != root[:-1]:
+                pipe.write_int64(-1)
+                continue
+            if not os.path.isdir(filename):
+                pipe.write_int64(-1)
+                continue
+            try:
+                message = '<html><head><title>{0}</title><style>body{{font-family: monospace;}} h1{{font-size: 125%;}} p{{margin:0px; padding:0px;}}</style></head><body><h1>Index of {0}</h1>\n'.format(urllib.parse.quote(filename))
+                for f in sorted(os.listdir(filename)):
+                    if os.path.isdir(os.path.join(filename, f)):
+                        f += b'/'
+                    message += '<p><a href="{0}">{0}</a></p>\n'.format(urllib.parse.quote(f))
+                message += '</body></html>\n'
+                message = message.encode('utf8')
+                if len(message) > max_chunk_size:
+                    pipe.write_int64(-1)
+                    continue
+                pipe.write_variable_bytes(message)
+            except:
+                pipe.write_int64(-1)
+        else:
+            break
+
+
+class ConnectionClosed(Exception):
+
+    pass
+
+
+class Client(threading.Thread):
+
+    def __init__(self, sock, address, remote, verbose, prefix):
+
+        self.sock = sock
+        self.address = address
+        self.remote = remote
+        self.verbose = verbose
+        self.prefix = prefix
+        assert self.prefix.endswith(b'/')
+
+        self.address_string = '{}:{:5}'.format(*self.address)
+
+        threading.Thread.__init__(self, daemon=True)
+
+    def sock_sendall(self, data):
+
+        try:
+            return self.sock.sendall(data)
+        except OSError:
+            raise ConnectionClosed
+
+    def run(self):
+
+        print('+ {} new connection'.format(self.address_string), file=sys.stderr)
+        try:
+            self.parse_requests()
+        except ConnectionClosed:
+            print('- {} closed unexpectedly'.format(self.address_string), file=sys.stderr)
+        else:
+            print('- {} closed'.format(self.address_string), file=sys.stderr)
+
+    def parse_requests(self):
+
+        buf_ba = bytearray(max_header_size)
+        buf_mv = memoryview(buf_ba)
+        n = 0
+
+        while True:
+
+            offset = 0
+            while True:
+                header_len = buf_ba.find(b'\r\n\r\n', max(0, offset-3), offset+n)
+                offset += n
+                if header_len >= 0:
+                    break
+                if offset >= max_header_size:
+                    self.write_response_status(b'HTTP/1.1', b'500 Internal Server Error')
+                    return
+                try:
+                    n = self.sock.recv_into(buf_mv[offset:])
+                except OSError:
+                    n = 0
+                if n == 0: # EOF
+                    if offset > 0:
+                        self.write_response_status(b'HTTP/1.1', b'400 Bad Request')
+                    return
+
+            header_lines = buf_ba[:offset-4].split(b'\r\n')
+            method, url, version = map(bytes, header_lines[0].split(b' '))
+            header = dict([bytes(v).strip() for v in line.split(b':', 1)] for line in header_lines[1:])
+
+            if version not in (b'HTTP/1.0', b'HTTP/1.1'):
+                # downgrade version to HTTP/1.1
+                version = b'HTTP/1.1'
+
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 1)
+
+            print('> {} {} {} {}'.format(self.address_string, method.decode('ascii'), url.decode('ascii'), version.decode('ascii')), file=sys.stderr)
+            if self.verbose:
+                for line in header_lines[1:]:
+                    print('> {} {}'.format(self.address_string, line.decode('ascii')), file=sys.stderr)
+                print('> {}'.format(self.address_string), file=sys.stderr)
+
+            if method == b'GET':
+                self.get(version, url, header)
+            else:
+                self.write_response_status(version, b'501 Not Implemented')
+                return
+
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 0)
+
+            if version == 'HTTP/1.0' or header.get(b'Connection', None) == b'close':
+                break
+
+            n = offset-header_len-4
+            buf_ba[:n] = buf_mv[header_len+4:offset]
+
+    def write_response(self, version, status, header, body, log_postfix=''):
+
+        if isinstance(body, int):
+            length = body
+            body = None
+        elif body is None:
+            length = None
+        else:
+            length = len(body)
+        if not log_postfix and length is not None:
+            log_postfix = '({} bytes)'.format(length)
+        print('< {} {} {} {}'.format(self.address_string, version.decode('ascii'), status.decode('ascii'), log_postfix), file=sys.stderr)
+        self.sock_sendall(version+b' '+status+b'\r\n')
+        self.sock_sendall(b'Accept-Ranges: bytes\r\n')
+        self.sock_sendall(header)
+        if length is not None:
+            self.sock_sendall(b'Content-Length: '+str(length).encode('ascii')+b'\r\n')
+        self.sock_sendall(b'\r\n')
+        if body is not None:
+            self.sock_sendall(body)
+
+    def write_response_status(self, version, status):
+
+        return self.write_response(version, status, b'Content-Type: text/plain\r\n', status+b'\r\n')
+
+    def redirect(self, version, url):
+
+        if version == b'HTTP/1.0':
+            status = b'302 Found'
+        else:
+            status = b'307 Temporary Redirect'
+        return self.write_response(version, status, b'Location: '+url+b'\r\n', status+b'\r\n'+url+b'\r\n')
+
+    def get(self, version, url, header):
+
+        type = mimetypes.guess_type(url.decode('ascii'))[0] or 'application/octet-stream'
+        type = type.encode('ascii')
+
+        if url + b'/' == self.prefix:
+            return self.redirect(version, self.prefix)
+        elif not url.startswith(self.prefix):
+            return self.write_response_status(version, b'404 Not Found')
+        rel_url = url[len(self.prefix):]
+
+        with self.remote.lock:
+            self.remote.write_bytes(cmd_get_file_size)
+            self.remote.write_variable_bytes(rel_url)
+            size = self.remote.read_int64()
+            if size == -2:
+                pass
+            elif size < 0:
+                return self.write_response_status(version, b'404 Not Found')
+
+        if size == -2:
+            if not url.endswith(b'/'):
+                return self.redirect(url+b'/')
+            else:
+                self.remote.write_bytes(cmd_list_dir)
+                self.remote.write_variable_bytes(rel_url)
+                size = self.remote.read_int64()
+                if size < 0:
+                    return self.write_response_status(version, b'404 Not Found')
+                message = self.remote.read_bytes(size)
+                return self.write_response(version, b'200 OK', b'Content-Type: text/html\r\n', message)
+
+        if b'Range' in header and header[b'Range'].startswith(b'bytes=') and b',' not in header[b'Range']:
+            start, stop = header[b'Range'][6:].split(b'-')
+            start = int(start) if start else 0
+            stop = int(stop)+1 if stop else size
+            assert 0 <= start < stop <= size
+            self.write_response(
+                version,
+                b'206 Partial Content',
+                b'Content-Type: '+type+b'\r\n'\
+                b'Content-Range: bytes '+'{}-{}/{}'.format(start, stop-1, size).encode('ascii')+b'\r\n',
+                start-stop,
+                '(bytes {}-{}/{})'.format(start, stop-1, size))
+        else:
+            start = 0
+            stop = size
+            self.write_response(version, b'200 OK', b'Content-Type: '+type+b'\r\n', size)
+
+        while start < stop:
+
+            with self.remote.lock:
+                self.remote.write_bytes(cmd_get_chunk)
+                self.remote.write_variable_bytes(rel_url)
+                self.remote.write_int64(start)
+                self.remote.write_int64(min(max_chunk_size, stop-start))
+                n = self.remote.read_int64()
+                if n == 0:
+                    raise ValueError('unexpected end of file')
+                start += n
+                chunk = self.remote.read_bytes(n)
+                self.sock_sendall(chunk)
+                # TODO: read into
+
+
+def run_server(pipe, http_host, http_port, verbose, server_prefix, **setings):
+
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((http_host, http_port))
+    server_socket.listen(5)
+
+    import select
+    poll = select.poll()
+    poll.register(pipe._i, select.POLLHUP)
+    poll.register(server_socket.fileno(), select.POLLIN|select.POLLHUP)
+    while True:
+        for fd, event in poll.poll():
+            if event & select.POLLHUP:
+                raise SystemExit
+            if fd == server_socket.fileno():
+                sock, address = server_socket.accept()
+                Client(sock, address, pipe, verbose, server_prefix).start()
+
+
+if __name__ == '__main__':
+
+    settings = dict(
+        http_host = 'localhost',
+        http_port = 8000,
+        server_host = None,
+        server_prefix = b'/',
+        ssh_command = ('ssh',),
+        verbose = False,
+    )
+
+    import sys
+
+    if len(sys.argv) == 1 or '--help' in sys.argv[1:]:
+        print('USAGE: {} [OPTIONS...] [[USER1@]HOST1:]SOURCE [[[USER2@]HOST2:]URL_PREFIX]'.format(sys.argv[0]))
+        print()
+        print('OPTIONS:')
+        print('  --host=HOST        set hostname of HTTP socket, default: {http_host}'.format(**settings))
+        print('  --port=PORT        set port of HTTP socket, default: {http_port}'.format(**settings))
+        print('  --ssh-command=CMD  set ssh command, default: {}'.format(' '.join(map(shlex.quote, settings['ssh_command']))))
+        print('  --verbose          show complete HTTP request headers')
+        print('  --help             print this help')
+        print()
+        print('EXAMPLES:')
+        print('  To serve from this host the directory "web" on remote host "server" run')
+        print('     {} server:web'.format(sys.argv[0]))
+        print('  To serve from remote host "server" the directory "web" on this host run')
+        print('     {} web server:'.format(sys.argv[0]))
+        raise SystemExit
+
+    args = iter(sys.argv)
+    next(args)
+    n = 0
+    for arg in args:
+        if arg.startswith('--'):
+            if '=' in arg:
+                arg, value = arg.split('=', 1)
+            else:
+                value = None
+            if arg == '--verbose':
+                if value is not None:
+                    print('ERROR: {} takes no argument'.format(arg), file=sys.stderr)
+                    raise SystemExit(1)
+                settings['verbose'] = True
+            elif arg == '--host':
+                if value is None:
+                    try:
+                        value = next(args)
+                    except StopIteration:
+                        print('ERROR: {} requires an argument'.format(arg), file=sys.stderr)
+                settings['http_host'] = value
+            elif arg == '--port':
+                if value is None:
+                    try:
+                        value = next(args)
+                    except StopIteration:
+                        print('ERROR: {} requires an argument'.format(arg), file=sys.stderr)
+                        raise SystemExit(1)
+                try:
+                    settings['http_port'] = int(value)
+                except ValueError:
+                    print('ERROR: {} requires an integer argument, got {}'.format(value), file=sys.stderr)
+                    raise SystemExit(1)
+            elif arg == '--ssh-command':
+                try:
+                    value = next(args)
+                except StopIteration:
+                    print('ERROR: {} requires an argument'.format(arg), file=sys.stderr)
+                    raise SystemExit(1)
+                value = tuple(shlex.split(value))
+                if len(value) == 0:
+                    print('ERROR: argument to {} is empty'.format(arg), file=sys.stderr)
+                    raise SystemExit(1)
+                settings['ssh_command'] = value
+            else:
+                raise ValueError('unknown argument: {}'.format(arg))
+        elif n == 0:
+            n += 1
+            if ':' in arg:
+                source_host, source_root = arg.split(':', 1)
+            else:
+                source_host, source_root = None, arg
+                source_root = arg
+            source_root = source_root.encode('utf8')
+            settings['source_host'] = source_host
+            settings['source_root'] = source_root
+        elif n == 1:
+            n += 1
+            if ':' in arg:
+                server_host, server_prefix = arg.split(':', 1)
+            else:
+                server_host, server_prefix = None, arg
+            server_prefix = server_prefix.encode('ascii')
+            if not server_prefix.startswith(b'/'):
+                server_prefix = b'/'+server_prefix
+            if not server_prefix.endswith(b'/'):
+                server_prefix += b'/'
+            settings['server_host'] = server_host
+            settings['server_prefix'] = server_prefix
+        else:
+            print('ERROR: unexpected argument: {}'.format(arg), file=sys.stderr)
+            raise SystemExit(1)
+    if n == 0:
+        print('ERROR: missing mandatory argument source directory', file=sys.stderr)
+        raise SystemExit(1)
+
+    if settings['source_host'] and settings['server_host']:
+        print('ERROR: both source and server on remote host is not supported')
+        raise SystemExit(1)
+
+    import hashlib, pickle
+
+    with open(__file__, 'rb') as f:
+        script = f.read()
+    pickle_settings = pickle.dumps(settings)
+
+    magic = hashlib.sha1(script).digest()
+
+    gen_boot_remote = lambda mode: 'python3 -c '+shlex.quote(
+        'import os, pickle\n'\
+        'l = b""\n'\
+        'while len(l) < {0}+{1}+{2}:\n'\
+        '    chunk = os.read(0, {0}+{1}+{2}-len(l))\n'\
+        '    if len(chunk) == 0:\n'\
+        '        raise EOFError\n'\
+        '    l += chunk\n'\
+        'magic = {3!r}\n'\
+        'assert l[:{0}] == magic, "ERROR: magic mismatch"\n'\
+        'd={{}}\n'\
+        'exec(l[{0}:{0}+{1}], d)\n'\
+        'pipe = d["RemotePipe"](0, 1)\n'\
+        'pipe.write_bytes(magic)\n'\
+        'd["run_{4}"](pipe, **pickle.loads(l[{0}+{1}:]))\n'\
+        .format(len(magic), len(script), len(pickle_settings), magic, mode))
+
+    if settings['source_host'] or settings['server_host']:
+        if settings['source_host']:
+            mode, run_here = 'source', run_server
+        else:
+            mode, run_here = 'server', run_source
+        cmd = settings['ssh_command']+(settings['{}_host'.format(mode)], gen_boot_remote(mode))
+        ssh = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        try:
+            pipe = RemotePipe(ssh.stdout.fileno(), ssh.stdin.fileno())
+            pipe.write_bytes(magic)
+            pipe.write_bytes(script)
+            pipe.write_bytes(pickle_settings)
+            if not magic == pipe.read_bytes(len(magic)):
+                print('ERROR: magic mismatch', file=sys.stderr)
+                raise SystemExit(1)
+            print('starting http server on {} at http://{http_host}:{http_port}'.format(settings['server_host'] or 'this host', **settings))
+            run_here(pipe, **settings)
+        except KeyboardInterrupt:
+            print('shutting down')
+        finally:
+            ssh.terminate()
+    else:
+        pipe_source, pipe_server = RemotePipe.pair()
+        source_thread = threading.Thread(target=run_source, args=[pipe_source], kwargs=settings).start()
+        print('starting http server on this host at http://{http_host}:{http_port}'.format(**settings))
+        try:
+            run_server(pipe_server, **settings)
+        except KeyboardInterrupt:
+            print('shutting down')
+        finally:
+            os.close(pipe_server._o)
