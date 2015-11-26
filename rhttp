@@ -293,6 +293,7 @@ class Client(threading.Thread):
 
     def get(self, version, url, header):
 
+        url = url.split(b'?')[0]
         type = mimetypes.guess_type(url.decode('ascii'))[0] or 'application/octet-stream'
         type = type.encode('ascii')
 
