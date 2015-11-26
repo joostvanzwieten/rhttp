@@ -391,7 +391,7 @@ if __name__ == '__main__':
     import sys
 
     if len(sys.argv) == 1 or '--help' in sys.argv[1:]:
-        print('USAGE: {} [OPTIONS...] [[USER1@]HOST1:]SOURCE [[[USER2@]HOST2:]URL_PREFIX]'.format(sys.argv[0]))
+        print('USAGE: {} [OPTIONS...] [[USER1@]HOST1:]SOURCE [[[USER2@]HOST2]:[URL_PREFIX]]'.format(sys.argv[0]))
         print()
         print('OPTIONS:')
         print('  --host=HOST        set hostname of HTTP socket, default: {http_host}'.format(**settings))
