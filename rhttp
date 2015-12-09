@@ -105,7 +105,7 @@ def run_source(pipe, source_root, **settings):
 
         cmd = pipe.read_bytes(1)
         if cmd == cmd_get_chunk:
-            filename = pipe.read_bytes()
+            filename = urllib.parse.unquote_to_bytes(pipe.read_bytes())
             offset = pipe.read_int64()
             size = pipe.read_int64()
             if size > max_chunk_size:
@@ -123,7 +123,7 @@ def run_source(pipe, source_root, **settings):
                 pipe.write_int64(-1)
                 continue
         elif cmd == cmd_get_file_size:
-            filename = pipe.read_bytes()
+            filename = urllib.parse.unquote_to_bytes(pipe.read_bytes())
             filename = os.path.realpath(os.path.join(root, filename))
             if not filename.startswith(root) and filename != root[:-1]:
                 pipe.write_int64(-1)
@@ -139,7 +139,7 @@ def run_source(pipe, source_root, **settings):
                 pipe.write_int64(-1)
                 continue
         elif cmd == cmd_list_dir:
-            filename = pipe.read_bytes()
+            filename = urllib.parse.unquote_to_bytes(pipe.read_bytes())
             filename = os.path.realpath(os.path.join(root, filename))
             if not filename.startswith(root) and filename != root[:-1]:
                 pipe.write_int64(-1)
