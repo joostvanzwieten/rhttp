@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-import os, struct, subprocess, socket, threading, sys, mimetypes, shlex, urllib
+import os, struct, subprocess, socket, threading, sys, mimetypes, shlex, urllib, html
 
 cmd_get_chunk = b'a'
 cmd_get_file_size = b'b'
@@ -152,7 +152,7 @@ def run_source(pipe, source_root, **settings):
                 for f in sorted(os.listdir(filename)):
                     if os.path.isdir(os.path.join(filename, f)):
                         f += b'/'
-                    message += '<p><a href="{0}">{0}</a></p>\n'.format(urllib.parse.quote(f))
+                    message += '<p><a href="{}">{}</a></p>\n'.format(urllib.parse.quote(f), html.escape(f.decode('utf8')))
                 message += '</body></html>\n'
                 message = message.encode('utf8')
                 if len(message) > max_chunk_size:
