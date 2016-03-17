@@ -314,7 +314,7 @@ class Client(threading.Thread):
 
         if size == -2:
             if not url.endswith(b'/'):
-                return self.redirect(url+b'/')
+                return self.redirect(version, url+b'/')
             else:
                 self.remote.write_bytes(cmd_list_dir)
                 self.remote.write_variable_bytes(rel_url)
